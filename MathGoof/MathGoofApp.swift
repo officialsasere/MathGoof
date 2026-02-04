@@ -1,17 +1,17 @@
-//
-//  MathGoofApp.swift
-//  MathGoof
-//
-//  Created by Sasere on 24/1/2026.
-//
 
 import SwiftUI
 
 @main
 struct MathGoofApp: App {
+    @State private var showSplash = true
+    
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            if showSplash {
+                SplashScreenView(isPresented: $showSplash)
+            } else {
+                GameView()
+            }
         }
     }
 }

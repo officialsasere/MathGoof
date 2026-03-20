@@ -35,10 +35,7 @@ import SwiftUI
 
 import Combine
 
-@MainActor   // Every property mutation happens on the main thread — required
-             // because RopePhysicsEngine is also @MainActor (CADisplayLink
-             // callbacks must run on main), and because all @Published
-             // property changes that drive SwiftUI must be on main.
+@MainActor
 class TugOfWarState: ObservableObject {
 
     // MARK: - Published game state (SwiftUI re-renders when these change)
@@ -67,6 +64,49 @@ class TugOfWarState: ObservableObject {
     /// The battle cry flashed on screen after each pull event.
     @Published var activeBattleCry: String? = nil
 
+    // MARK: - Sprint 1 features
+
+    /// Feature 9 — Streak counter.
+    /// Counts consecutive correct answers in the current round.
+    /// Resets to 0 on any wrong answer or when a new round starts.
+    /// The view shows a fire badge "🔥 ×3" when this is ≥ 2.
+    @Published var correctStreak: Int = 0
+
+    /// Feature 10 — Sound toggle.
+    /// When false, TugOfWarView passes this flag to TugAudioManager and all
+    /// sounds/haptics are skipped. Persisted in UserDefaults so the
+    /// setting survives app restarts.
+    @Published var isSoundEnabled: Bool = UserDefaults.standard.object(forKey: "tugSoundEnabled") as? Bool ?? true
+
+    /// Feature 4 — CPU personality state.
+    /// Changes based on who is currently winning the rope.
+    /// The view uses this to show a different emoji expression on the CPU avatar.
+    enum CPUMood { case neutral, nervous, cocky, desperate }
+    @Published var cpuMood: CPUMood = .neutral
+
+    // MARK: - Sprint 2 features
+
+    /// Feature 1 — Countdown timer.
+    /// Fraction remaining: 1.0 = full time, 0.0 = time up.
+    /// Driven by a Timer that fires every 0.05s.
+    @Published var timerFraction: Double = 1.0
+
+    /// Feature 2 — Stars earned this round (1–3). Set at win time.
+    /// 0 means the round hasn't been won yet.
+    @Published var starsEarned: Int = 0
+
+    /// Feature 3 — Power-up availability.
+    /// True when the player has earned a Super Pull and hasn't used it yet.
+    @Published var powerUpReady: Bool = false
+
+    /// Feature 3 — Visual flash when the power-up fires.
+    @Published var powerUpFlash: Bool = false
+
+    /// Feature 6 — Reference to the persistent player profile.
+    /// Weak so TugOfWarState doesn't keep the profile alive if the app root
+    /// releases it (though in practice it lives for the whole app lifetime).
+    weak var profile: PlayerProfile?
+
 
     // MARK: - Physics engine (the rope's real-time loop)
 
@@ -86,6 +126,32 @@ class TugOfWarState: ObservableObject {
 
     private var adaptiveEngine: AdaptiveEngine
 
+    /// Feature 1 — the repeating timer that drains timerFraction each tick.
+    private var questionTimer: Timer?
+
+    /// Feature 1 — total seconds allowed per question, set per level.
+    private var questionTimeLimit: Double = 10.0
+
+    /// Feature 1 — seconds elapsed since the current question appeared.
+    private var questionTimeElapsed: Double = 0.0
+
+    /// Feature 3 — counts correct answers toward the next power-up.
+    /// Resets to 0 each time a power-up is awarded.
+    private var answersTowardPowerUp: Int = 0
+
+    /// Feature 6 — tracks correct answers this round for profile recording.
+    private var roundCorrectAnswers: Int = 0
+
+    /// Feature 6 — tracks the fastest answer time this round (ms).
+    private var roundFastestMs: Int = 0
+
+    /// Feature 7 — Daily challenge question queue.
+    /// When non-nil, generateChallenge() is NOT called — questions are
+    /// consumed from this list in order. This is how we inject the seeded
+    /// daily questions without changing any other game logic.
+    private var dailyQuestions: [MathChallenge]? = nil
+    private var dailyQuestionIndex: Int = 0
+
 
     // MARK: - Computed helpers
 
@@ -101,14 +167,16 @@ class TugOfWarState: ObservableObject {
 
     // MARK: - Init
 
-    init(playerAvatar: Avatar) {
+    /// Standard init for VS-CPU and level-map play.
+    init(playerAvatar: Avatar, startLevel: Int = 1, profile: PlayerProfile? = nil) {
         self.playerAvatar = playerAvatar
+        self.profile      = profile
+        self.currentLevel = startLevel   // Feature 5: start at the chosen map level
 
-        // CPU gets a random avatar that is different from the player's choice
         let others = Avatar.allAvatars.filter { $0.id != playerAvatar.id }
         self.cpuAvatar = others.randomElement() ?? Avatar.allAvatars[0]
 
-        self.adaptiveEngine   = AdaptiveEngine(level: 1)
+        self.adaptiveEngine   = AdaptiveEngine(level: startLevel)
         self.currentChallenge = adaptiveEngine.generateChallenge()
 
         // Subscribe to the rope's position so we can detect game-over
@@ -125,6 +193,18 @@ class TugOfWarState: ObservableObject {
             .store(in: &cancellables)
     }
 
+    /// Daily challenge init — same as standard but injects pre-seeded questions.
+    /// The rope, CPU, timer, and all other mechanics work identically.
+    convenience init(playerAvatar: Avatar,
+                     dailyQuestions: [MathChallenge],
+                     profile: PlayerProfile? = nil) {
+        self.init(playerAvatar: playerAvatar, startLevel: 5, profile: profile)
+        self.dailyQuestions = dailyQuestions
+        self.dailyQuestionIndex = 0
+        // Replace the first question with the first daily question
+        self.currentChallenge = dailyQuestions[0]
+    }
+
 
     // MARK: - Game Loop
 
@@ -136,12 +216,61 @@ class TugOfWarState: ObservableObject {
     ///   the @StateObject initialiser in the view more complicated. Deferring
     ///   to `.onAppear` is the standard SwiftUI pattern.
     func startGameLoop() {
-        // Stop any existing display link first — critical when called from
-        // startRound() so we don't have two display links running at once.
         rope.stop()
         syncDifficultyToRope()
         rope.start()
         adaptiveEngine.startTimer()
+        startQuestionTimer()   // Feature 1
+    }
+
+    // MARK: - Feature 1: Question Timer
+
+    /// Starts the per-question countdown. The time limit shrinks with level:
+    ///   Level 1 = 12s, Level 5 = 8s, Level 10 = 5s.
+    /// When it hits zero the CPU gets a free pull and a new question loads.
+    private func startQuestionTimer() {
+        questionTimer?.invalidate()
+        questionTimeElapsed = 0.0
+        // Time limit decreases with level — higher levels demand faster answers
+        questionTimeLimit = max(5.0, 12.0 - Double(adaptiveEngine.currentLevel - 1) * 0.75)
+        timerFraction = 1.0
+
+        questionTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
+            // Timer callbacks are nonisolated — we must explicitly hop to
+            // MainActor because tickQuestionTimer() mutates @Published state.
+            Task { @MainActor [weak self] in
+                self?.tickQuestionTimer()
+            }
+        }
+    }
+
+    private func tickQuestionTimer() {
+        guard !gameOver, selectedAnswer == nil else { return }
+        questionTimeElapsed += 0.05
+        timerFraction = max(0.0, 1.0 - (questionTimeElapsed / questionTimeLimit))
+
+        if timerFraction <= 0 {
+            // Time's up — CPU gets a free pull, load next question
+            questionTimer?.invalidate()
+            rope.applyWrongAnswer()   // CPU free pull
+            correctStreak = 0         // streak breaks on timeout
+            answersTowardPowerUp = 0
+            updateCPUMood()
+
+            // Brief pause then next question
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+                guard let self, !self.gameOver else { return }
+                self.currentChallenge = self.nextQuestion()
+                self.adaptiveEngine.startTimer()
+                self.startQuestionTimer()
+            }
+        }
+    }
+
+    private func stopQuestionTimer() {
+        questionTimer?.invalidate()
+        questionTimer = nil
+        timerFraction = 1.0
     }
 
     /// Keeps the rope's levelDriftMultiplier in sync with the adaptive engine.
@@ -160,6 +289,12 @@ class TugOfWarState: ObservableObject {
     /// like a noticeable increase without a sudden difficulty spike.
     private func syncDifficultyToRope() {
         rope.levelDriftMultiplier = 1.0 + Double(adaptiveEngine.currentLevel - 1) * 0.20
+    }
+
+    /// Feature 10 — toggles sound on/off and persists the choice.
+    func toggleSound() {
+        isSoundEnabled.toggle()
+        UserDefaults.standard.set(isSoundEnabled, forKey: "tugSoundEnabled")
     }
 
 
@@ -186,51 +321,83 @@ class TugOfWarState: ObservableObject {
 
         if lastAnswerCorrect {
             // ── Correct ───────────────────────────────────────────────────────
-            // Scale pull strength by how fast the player answered.
-            // Fast answers reward confident knowledge; slow answers still count
-            // but give a smaller advantage.
             rope.correctPullStrength = playerPullStrength(for: responseTime)
             rope.applyCorrectAnswer()
 
-            flashGreen      = true
-            activeBattleCry = playerAvatar.battleCry
+            // Feature 9: streak
+            correctStreak += 1
+            activeBattleCry = correctStreak >= 3
+                ? "🔥 ON FIRE! \(playerAvatar.battleCry)"
+                : playerAvatar.battleCry
+            flashGreen = true
+
+            // Feature 3: count toward power-up (every 3 correct in a row)
+            answersTowardPowerUp += 1
+            if answersTowardPowerUp >= 3, !powerUpReady {
+                powerUpReady = true
+                answersTowardPowerUp = 0
+            }
+
+            // Feature 6: track correct answers and fastest time for profile
+            roundCorrectAnswers += 1
+            let ms = Int(responseTime * 1000)
+            if roundFastestMs == 0 || ms < roundFastestMs { roundFastestMs = ms }
 
             if shouldLevelUp {
                 adaptiveEngine.adjustDifficulty(levelChange: +1)
-                syncDifficultyToRope()   // rope gets harder immediately
+                syncDifficultyToRope()
             }
 
         } else {
             // ── Wrong ────────────────────────────────────────────────────────
-            // The physics engine applies its wrongAnswerPenalty (0.30 by default)
-            // on top of the constant drift — so wrong answers feel costly.
             rope.applyWrongAnswer()
-
-            flashRed        = true
+            correctStreak = 0
+            answersTowardPowerUp = 0   // Feature 3: reset on wrong answer
             activeBattleCry = cpuAvatar.battleCry
+            flashRed = true
 
             if shouldLevelDown {
                 adaptiveEngine.adjustDifficulty(levelChange: -1)
-                syncDifficultyToRope()   // rope eases off immediately
+                syncDifficultyToRope()
             }
         }
+
+        updateCPUMood()
 
         // gameOver may have been triggered synchronously inside applyCorrectAnswer /
         // applyWrongAnswer via the Combine subscription — check before scheduling
         // the next question.
         if gameOver { return }
 
-        // 0.9s pause: long enough for the kid to read the battle cry and see
-        // the button colour, short enough to keep momentum.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) { [weak self] in
             guard let self, !self.gameOver else { return }
             self.flashGreen       = false
             self.flashRed         = false
             self.activeBattleCry  = nil
             self.selectedAnswer   = nil
-            self.currentChallenge = self.adaptiveEngine.generateChallenge()
+            self.currentChallenge = self.nextQuestion()
             self.adaptiveEngine.startTimer()
+            self.startQuestionTimer()   // Feature 1: restart countdown
         }
+    }
+
+
+    // MARK: - Question Source
+
+    /// Returns the next question from the daily queue (if set) or from the
+    /// adaptive engine. This single method is the only place question
+    /// generation happens — all callers use it instead of calling
+    /// adaptiveEngine.generateChallenge() directly.
+    private func nextQuestion() -> MathChallenge {
+        if var queue = dailyQuestions {
+            dailyQuestionIndex += 1
+            if dailyQuestionIndex < queue.count {
+                return queue[dailyQuestionIndex]
+            }
+            // Queue exhausted — fall through to adaptive engine
+            dailyQuestions = nil
+        }
+        return adaptiveEngine.generateChallenge()
     }
 
 
@@ -253,15 +420,79 @@ class TugOfWarState: ObservableObject {
         return 0.25
     }
 
+    // MARK: - Feature 3: Power-Up
+
+    /// Called when the player taps the Super Pull button.
+    /// Gives a massive one-time rope yank (0.70 — more than a correct answer).
+    /// The button is only shown when powerUpReady == true.
+    func activatePowerUp() {
+        guard powerUpReady, !gameOver else { return }
+        powerUpReady  = false
+        powerUpFlash  = true
+
+        rope.correctPullStrength = 0.70
+        rope.applyCorrectAnswer()
+        updateCPUMood()
+
+        // Flash fades after 0.4s
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+            self?.powerUpFlash = false
+        }
+    }
+
+
+    // MARK: - CPU Mood (Feature 4)
+
+    /// Updates the CPU's displayed emotion based on who is winning.
+    ///
+    ///   rope > +0.4  → CPU is nervous (player is winning)
+    ///   rope > +0.7  → CPU is desperate (player is very close to winning)
+    ///   rope < -0.4  → CPU is cocky (CPU is winning)
+    ///   otherwise    → neutral
+    ///
+    /// Called after every answer so the CPU reacts in real time.
+    private func updateCPUMood() {
+        let p = rope.position
+        if p > 0.7 {
+            cpuMood = .desperate
+        } else if p > 0.4 {
+            cpuMood = .nervous
+        } else if p < -0.4 {
+            cpuMood = .cocky
+        } else {
+            cpuMood = .neutral
+        }
+    }
 
     // MARK: - Win Condition
 
     /// Called automatically by the Combine subscription every time rope.position
-    /// changes. Stops the physics loop and flags game over.
+    /// changes. Stops the physics loop, calculates stars, saves profile.
     private func checkGameOver(position: Double) {
         guard !gameOver, abs(position) >= 1.0 else { return }
         gameOver = true
-        rope.stop()   // stop the CADisplayLink — no more CPU cycles wasted
+        rope.stop()
+        stopQuestionTimer()   // Feature 1: stop countdown
+
+        // Feature 2: calculate stars only on a player win
+        if position >= 1.0 {
+            starsEarned = LevelResult.stars(for: Double(correctStreak) / 5.0 + 0.5)
+            // Better heuristic: base stars on how dominant the win was.
+            // We use the rope's peak (always 1.0 at win), so we instead
+            // derive stars from streak and speed together:
+            //   streak >= 4 → 3 stars, streak >= 2 → 2 stars, else 1 star
+            starsEarned = correctStreak >= 4 ? 3 : correctStreak >= 2 ? 2 : 1
+
+            // Feature 6: record win in player profile
+            profile?.recordWin(
+                level:           currentLevel,
+                ropePosition:    position,
+                correctAnswers:  roundCorrectAnswers,
+                fastestAnswerMs: roundFastestMs
+            )
+        } else {
+            starsEarned = 0
+        }
     }
 
 
@@ -303,12 +534,23 @@ class TugOfWarState: ObservableObject {
         flashGreen        = false
         flashRed          = false
         activeBattleCry   = nil
-        gameOver          = false   // ← this dismisses the overlay
+        correctStreak        = 0
+        cpuMood              = .neutral
+        // Sprint 2 resets
+        starsEarned          = 0
+        powerUpReady         = false
+        powerUpFlash         = false
+        answersTowardPowerUp = 0
+        roundCorrectAnswers  = 0
+        roundFastestMs       = 0
+        stopQuestionTimer()
+        gameOver             = false
 
         // Start AdaptiveEngine at the stage level so question difficulty
         // and CPU drift both match where the player is in the game.
-        adaptiveEngine   = AdaptiveEngine(level: level)
-        currentChallenge = adaptiveEngine.generateChallenge()
+        adaptiveEngine      = AdaptiveEngine(level: level)
+        dailyQuestionIndex  = 0   // reset daily queue if retrying
+        currentChallenge    = nextQuestion()
 
         startGameLoop()   // 4. start fresh
     }

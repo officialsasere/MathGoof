@@ -24,8 +24,9 @@ struct TugOfWarView: View {
 
     // Creating TugOfWarState inside init lets us pass playerAvatar into it.
     // The @StateObject wrapper then owns the object for the view's lifetime.
-    init(playerAvatar: Avatar, onQuit: @escaping () -> Void) {
-        _game = StateObject(wrappedValue: TugOfWarState(playerAvatar: playerAvatar))
+    /// `startLevel` comes from the level map so the game begins at the chosen stage.
+    init(playerAvatar: Avatar, startLevel: Int = 1, profile: PlayerProfile? = nil, onQuit: @escaping () -> Void) {
+        _game = StateObject(wrappedValue: TugOfWarState(playerAvatar: playerAvatar, startLevel: startLevel, profile: profile))
         self.onQuit = onQuit
     }
 
@@ -46,6 +47,8 @@ struct TugOfWarView: View {
                     playerAvatar: game.playerAvatar,
                     cpuAvatar: game.cpuAvatar,
                     level: game.level,
+                    isSoundEnabled: game.isSoundEnabled,
+                    onToggleSound: { game.toggleSound() },
                     onQuit: onQuit
                 )
                 .padding(.horizontal, 20)
@@ -62,14 +65,46 @@ struct TugOfWarView: View {
                         ropeValue: game.rope.position,
                         flashGreen: game.flashGreen,
                         flashRed: game.flashRed,
-                        containerWidth: geo.size.width
+                        containerWidth: geo.size.width,
+                        cpuMood: game.cpuMood
                     )
                 }
                 .frame(height: 170)
 
+                // ── Feature 1: Countdown timer bar ───────────────────────────
+                TimerBar(fraction: game.timerFraction)
+                    .padding(.horizontal, 24)
+
+                // ── Feature 3: Power-up button ────────────────────────────────
+                // Only visible when powerUpReady == true. Fixed height so the
+                // layout doesn't jump when it appears/disappears.
+                ZStack {
+                    if game.powerUpReady {
+                        Button(action: { game.activatePowerUp() }) {
+                            HStack(spacing: 8) {
+                                Text("⚡️")
+                                Text("SUPER PULL!")
+                                    .font(.system(size: 16, weight: .black, design: .rounded))
+                                Text("⚡️")
+                            }
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 20)
+                            .padding(.vertical, 8)
+                            .background(
+                                LinearGradient(colors: [.yellow, .orange], startPoint: .leading, endPoint: .trailing)
+                            )
+                            .cornerRadius(20)
+                            .shadow(color: .orange.opacity(0.6), radius: 8)
+                            .scaleEffect(game.powerUpFlash ? 1.15 : 1.0)
+                        }
+                        .transition(.scale.combined(with: .opacity))
+                        .animation(.spring(response: 0.3, dampingFraction: 0.5), value: game.powerUpFlash)
+                    }
+                }
+                .frame(height: 44)
+                .animation(.spring(response: 0.4, dampingFraction: 0.7), value: game.powerUpReady)
+
                 // ── Battle cry ────────────────────────────────────────────────
-                // Fixed-height container prevents the layout from jumping when
-                // the battle cry appears and disappears.
                 ZStack {
                     if let cry = game.activeBattleCry {
                         Text("💬 \(cry)")
@@ -84,6 +119,27 @@ struct TugOfWarView: View {
                 }
                 .frame(height: 36)
                 .animation(.spring(response: 0.3, dampingFraction: 0.7), value: game.activeBattleCry)
+
+                // ── Feature 9: Streak counter ─────────────────────────────────
+                // Only visible when streak >= 2. Fixed height prevents layout jump.
+                ZStack {
+                    if game.correctStreak >= 2 {
+                        HStack(spacing: 6) {
+                            Text("🔥")
+                                .font(.title2)
+                            Text("×\(game.correctStreak)")
+                                .font(.system(size: 22, weight: .black, design: .rounded))
+                                .foregroundColor(.orange)
+                        }
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 6)
+                        .background(Color.orange.opacity(0.2))
+                        .cornerRadius(20)
+                        .transition(.scale.combined(with: .opacity))
+                    }
+                }
+                .frame(height: 36)
+                .animation(.spring(response: 0.3, dampingFraction: 0.6), value: game.correctStreak)
 
                 // ── Math question ─────────────────────────────────────────────
                 Text(game.currentChallenge.questionText)
@@ -107,12 +163,13 @@ struct TugOfWarView: View {
                             selectedAnswer: game.selectedAnswer,
                             correctAnswer: game.currentChallenge.correctAnswer
                         ) {
-                            // Play sound BEFORE submitting so the haptic lands
-                            // at the exact moment of the tap
-                            if num == game.currentChallenge.correctAnswer {
-                                audio.playCorrectPull()
-                            } else {
-                                audio.playWrongPull()
+                            // Feature 10: only play sounds when enabled
+                            if game.isSoundEnabled {
+                                if num == game.currentChallenge.correctAnswer {
+                                    audio.playCorrectPull()
+                                } else {
+                                    audio.playWrongPull()
+                                }
                             }
                             game.answer(num)
                         }
@@ -129,40 +186,43 @@ struct TugOfWarView: View {
                 GameOverOverlay(
                     playerWon: game.rope.position >= 0,
                     currentLevel: game.currentLevel,
+                    starsEarned: game.starsEarned,
                     playerAvatar: game.playerAvatar,
                     cpuAvatar: game.cpuAvatar,
                     onNextLevel: {
                         game.nextLevel()
-                        audio.playMatchStart()
+                        if game.isSoundEnabled { audio.playMatchStart() }
                     },
                     onRetry: {
                         game.retryLevel()
-                        audio.playMatchStart()
+                        if game.isSoundEnabled { audio.playMatchStart() }
                     },
                     onQuit: onQuit
                 )
-                // .id forces SwiftUI to fully destroy and recreate this view
-                // each time the level changes. Without it, SwiftUI reuses the
-                // existing GameOverOverlay and its @State (scale, showConfetti)
-                // stays stale — the overlay appears frozen and never dismisses.
-                .id("overlay-\(game.currentLevel)")
+                // .id forces SwiftUI to destroy and recreate this view from
+                // scratch whenever currentLevel changes. Without this, SwiftUI
+                // reuses the existing GameOverOverlay and its @State values
+                // (scale, showConfetti) are stale — the overlay never resets
+                // its entrance animation and appears stuck on screen.
+                .id("gameover-\(game.currentLevel)-\(game.gameOver)")
                 .transition(.opacity)
             }
         }
         .onAppear {
             game.startGameLoop()
-            audio.playMatchStart()
+            if game.isSoundEnabled { audio.playMatchStart() }  // Feature 10
         }
         .onChange(of: game.gameOver) { _, isOver in
-            if isOver {
+            if isOver, game.isSoundEnabled {   // Feature 10
                 game.rope.position >= 0
                     ? audio.playPlayerWins()
                     : audio.playCPUWins()
             }
         }
         .onChange(of: game.rope.isNearEdge) { _, nearEdge in
-            if nearEdge { audio.playRopeTension() }
+            if nearEdge, game.isSoundEnabled { audio.playRopeTension() }  // Feature 10
         }
+        .animation(.easeInOut(duration: 0.3), value: game.gameOver)
     }
 }
 
@@ -174,6 +234,8 @@ struct TopBar: View {
     let playerAvatar: Avatar
     let cpuAvatar: Avatar
     let level: Int
+    let isSoundEnabled: Bool      // Feature 10
+    let onToggleSound: () -> Void // Feature 10
     let onQuit: () -> Void
 
     var body: some View {
@@ -195,11 +257,19 @@ struct TopBar: View {
 
             Text(cpuAvatar.emoji).font(.title)
 
+            // Feature 10: sound toggle button
+            Button(action: onToggleSound) {
+                Image(systemName: isSoundEnabled ? "speaker.wave.2.fill" : "speaker.slash.fill")
+                    .font(.title3)
+                    .foregroundColor(isSoundEnabled ? .white.opacity(0.7) : .white.opacity(0.3))
+                    .padding(.leading, 6)
+            }
+
             Button(action: onQuit) {
                 Image(systemName: "xmark.circle.fill")
                     .font(.title3)
                     .foregroundColor(.white.opacity(0.6))
-                    .padding(.leading, 8)
+                    .padding(.leading, 4)
             }
         }
         .padding(.vertical, 10)
@@ -228,6 +298,7 @@ struct RopeArena: View {
     let flashGreen: Bool
     let flashRed: Bool
     let containerWidth: CGFloat
+    let cpuMood: TugOfWarState.CPUMood  // Feature 4
 
     /// How far from each edge the avatar sits (in points).
     private let avatarPadding: CGFloat = 50
@@ -236,6 +307,21 @@ struct RopeArena: View {
     private var maxKnotOffset: CGFloat {
         containerWidth / 2 - avatarPadding - 30
     }
+
+    // Feature 4: overlay emoji that reacts to the CPU's current mood.
+    // Shown as a small badge above the CPU avatar.
+    private var cpuMoodEmoji: String {
+        switch cpuMood {
+        case .neutral:   return ""
+        case .nervous:   return "😰"
+        case .cocky:     return "😏"
+        case .desperate: return "😱"
+        }
+    }
+
+    // Feature 8: shake offset — non-zero when rope is near the edge.
+    // Driven by a repeating spring animation in the view body.
+    @State private var shakeOffset: CGFloat = 0
 
     var body: some View {
         ZStack {
@@ -315,15 +401,39 @@ struct RopeArena: View {
                 .padding(.leading, 0)
                 .animation(.spring(response: 0.25, dampingFraction: 0.4), value: flashGreen)
 
-            // ── CPU avatar (right side) ───────────────────────────────────────
-            Text(cpuAvatar.emoji)
-                .font(.system(size: 80))
-                .scaleEffect(flashRed ? 1.3 : 1.0)
-                .frame(maxWidth: .infinity, alignment: .trailing)
-                .padding(.trailing, 0)
-                .animation(.spring(response: 0.25, dampingFraction: 0.4), value: flashRed)
+            // ── CPU avatar (right side) with mood badge (Feature 4) ──────────
+            ZStack(alignment: .topLeading) {
+                Text(cpuAvatar.emoji)
+                    .font(.system(size: 80))
+                    .scaleEffect(flashRed ? 1.3 : 1.0)
+                    .animation(.spring(response: 0.25, dampingFraction: 0.4), value: flashRed)
+
+                // Mood badge — only shown when CPU has a non-neutral mood
+                if !cpuMoodEmoji.isEmpty {
+                    Text(cpuMoodEmoji)
+                        .font(.title3)
+                        .transition(.scale.combined(with: .opacity))
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .trailing)
+            .animation(.spring(response: 0.3, dampingFraction: 0.6), value: cpuMood == .neutral)
         }
+        // Feature 8: rope shake when near edge.
+        // The whole arena shifts left-right rapidly to simulate physical tension.
+        .offset(x: shakeOffset)
         .padding(.horizontal, 8)
+        .onChange(of: abs(ropeValue) > 0.75) { _, nearEdge in
+            if nearEdge {
+                withAnimation(.interpolatingSpring(stiffness: 400, damping: 5).repeatCount(6, autoreverses: true)) {
+                    shakeOffset = 6
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                    shakeOffset = 0
+                }
+            } else {
+                shakeOffset = 0
+            }
+        }
     }
 }
 
@@ -384,11 +494,12 @@ struct AnswerTile: View {
 /// Both → show "Change Avatar" to return to the picker
 struct GameOverOverlay: View {
     let playerWon: Bool
-    let currentLevel: Int       // the level that just finished
+    let currentLevel: Int
+    let starsEarned: Int        // Feature 2: 0 = loss, 1–3 = win quality
     let playerAvatar: Avatar
     let cpuAvatar: Avatar
-    let onNextLevel: () -> Void  // called on win — advances to next level
-    let onRetry: () -> Void      // called on loss — retries the same level
+    let onNextLevel: () -> Void
+    let onRetry: () -> Void
     let onQuit: () -> Void
 
     @State private var scale: CGFloat = 0.4
@@ -410,10 +521,13 @@ struct GameOverOverlay: View {
                         Text("🏆 LEVEL \(currentLevel) CLEAR! 🏆")
                             .font(.system(size: 34, weight: .black, design: .rounded))
                             .foregroundColor(.yellow)
+
+                        // Feature 2: star rating
+                        StarRatingView(stars: starsEarned)
+
                         Text("\(playerAvatar.emoji) pulled it all the way!")
                             .font(.title3)
                             .foregroundColor(.white.opacity(0.9))
-                        // Preview of what's coming next
                         if currentLevel < 10 {
                             Text("Level \(currentLevel + 1) awaits... 🔥")
                                 .font(.subheadline.bold())
@@ -542,6 +656,87 @@ struct ConfettiOverlay: View {
                     pieces[i].rotation  += 540
                     pieces[i].opacity    = 0
                 }
+            }
+        }
+    }
+}
+
+
+
+// MARK: - TimerBar  (Feature 1)
+
+/// A thin horizontal bar that shrinks from full to empty over the question
+/// time limit. Colour shifts green → yellow → red as time runs out.
+///
+/// Why a separate View?
+///   It has its own colour-interpolation logic. Extracting it keeps the
+///   main body clean and makes the bar easy to tweak independently.
+struct TimerBar: View {
+
+    /// 1.0 = full time remaining, 0.0 = time up.
+    let fraction: Double
+
+    /// Colour interpolates through three zones:
+    ///   > 0.5  → green  (plenty of time)
+    ///   > 0.25 → yellow (getting tight)
+    ///   ≤ 0.25 → red    (almost out of time)
+    private var barColor: Color {
+        if fraction > 0.5  { return .green }
+        if fraction > 0.25 { return .yellow }
+        return .red
+    }
+
+    var body: some View {
+        GeometryReader { geo in
+            ZStack(alignment: .leading) {
+                // Background track
+                RoundedRectangle(cornerRadius: 4)
+                    .fill(Color.white.opacity(0.2))
+                    .frame(height: 8)
+
+                // Filled portion — width scales with fraction
+                RoundedRectangle(cornerRadius: 4)
+                    .fill(barColor)
+                    .frame(width: max(0, geo.size.width * CGFloat(fraction)), height: 8)
+                    .animation(.linear(duration: 0.05), value: fraction)
+            }
+        }
+        .frame(height: 8)
+    }
+}
+
+
+// MARK: - StarRatingView  (Feature 2)
+
+/// Displays 1–3 filled stars (earned) plus empty star outlines (not earned).
+/// Used on the win game-over screen to show the quality of the player's win.
+struct StarRatingView: View {
+
+    /// Number of filled stars (1–3). 0 = no stars (shouldn't appear on win).
+    let stars: Int
+
+    @State private var animateIn = false
+
+    var body: some View {
+        HStack(spacing: 8) {
+            ForEach(1...3, id: \.self) { i in
+                Image(systemName: i <= stars ? "star.fill" : "star")
+                    .font(.system(size: 36))
+                    .foregroundColor(i <= stars ? .yellow : .white.opacity(0.3))
+                    // Each star pops in with a slight delay for a cascade effect
+                    .scaleEffect(animateIn && i <= stars ? 1.0 : 0.4)
+                    .animation(
+                        .spring(response: 0.4, dampingFraction: 0.55)
+                            .delay(Double(i - 1) * 0.12),
+                        value: animateIn
+                    )
+            }
+        }
+        .shadow(color: .yellow.opacity(0.6), radius: 8)
+        .onAppear {
+            // Small delay so the overlay entrance animation settles first
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                animateIn = true
             }
         }
     }

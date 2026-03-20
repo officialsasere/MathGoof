@@ -52,30 +52,40 @@ struct MathChallenge {
         }
     }
 
-    /// Generates exactly 2 wrong answers that are close to the correct answer
-    /// to make the challenge genuinely tricky (not trivially obvious).
-    var wrongAnswers: [Int] {
-        var answers: Set<Int> = []
-        let range = max(difficulty.answerRange, 5)
+    /// All 3 answer choices in a fixed random order, generated ONCE at init.
+    ///
+    /// Why stored instead of computed?
+    ///   The old computed properties called Int.random() and .shuffled() on
+    ///   every access. SwiftUI re-renders on every @Published change — including
+    ///   timerFraction ticking 20x/sec — so the answers reshuffled constantly,
+    ///   making it impossible to tap one. Storing the result once at init time
+    ///   fixes the order for the lifetime of the challenge.
+    let allAnswers: [Int]
 
-        while answers.count < 2 {
+    init(firstNumber: Int,
+         secondNumber: Int,
+         operation: Operation,
+         correctAnswer: Int,
+         difficulty: DifficultyLevel) {
+        self.firstNumber   = firstNumber
+        self.secondNumber  = secondNumber
+        self.operation     = operation
+        self.correctAnswer = correctAnswer
+        self.difficulty    = difficulty
+
+        // Generate 2 distinct wrong answers, then shuffle all 3 exactly once
+        var wrong: Set<Int> = []
+        let range = max(difficulty.answerRange, 5)
+        while wrong.count < 2 {
             let offset = Int.random(in: 1...range)
-            // Randomly add or subtract the offset so distractors appear on
-            // both sides of the correct answer
-            let wrong = Bool.random() ? correctAnswer + offset : correctAnswer - offset
-            if wrong != correctAnswer && wrong >= 0 {
-                answers.insert(wrong)
+            let candidate = Bool.random() ? correctAnswer + offset : correctAnswer - offset
+            if candidate != correctAnswer && candidate >= 0 {
+                wrong.insert(candidate)
             }
         }
-        return Array(answers)
-    }
-
-    /// Returns all 3 answer choices in a random order so the correct answer
-    /// isn't always in the same position.
-    var allAnswers: [Int] {
-        var answers = wrongAnswers
-        answers.append(correctAnswer)
-        return answers.shuffled()
+        var all = Array(wrong)
+        all.append(correctAnswer)
+        self.allAnswers = all.shuffled()
     }
 
     /// The formatted equation string shown in the UI, e.g. "7 + 5 ="

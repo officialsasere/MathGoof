@@ -14,15 +14,20 @@ import SwiftUI
 
 struct AvatarPickerView: View {
 
-    // ── Callback ──────────────────────────────────────────────────────────────
-    // We pass the chosen avatar UP to the parent (MathGoofApp) rather than
-    // pushing a new view ourselves. This keeps navigation logic in one place.
+    @ObservedObject var profile: PlayerProfile
     let onStartGame: (Avatar) -> Void
+    /// Feature 11: called when the player wants to start a 2-player match.
+    /// MathGoofApp shows a second avatar picker for player 2.
+    let onMultiplayer: (Avatar) -> Void
 
     // ── Local state ───────────────────────────────────────────────────────────
 
     /// Which avatar the player has tapped. Nil until they make a choice.
     @State private var selectedAvatar: Avatar? = nil
+
+    /// Feature 6: controls the name-entry sheet for first-time players.
+    @State private var showNameEntry: Bool = false
+    @State private var pendingAvatar: Avatar? = nil   // avatar chosen before name entry
 
     /// Controls the reveal animation for the CPU avatar card.
     @State private var showCPUAvatar: Bool = false
@@ -51,6 +56,11 @@ struct AvatarPickerView: View {
 
             VStack(spacing: 24) {
 
+                // ── Feature 6: Profile header ─────────────────────────────────
+                ProfileHeader(profile: profile)
+                    .padding(.top, 12)
+                    .padding(.horizontal, 20)
+
                 // ── Title ─────────────────────────────────────────────────────
                 VStack(spacing: 6) {
                     Text("🪢 Tug of War")
@@ -61,7 +71,7 @@ struct AvatarPickerView: View {
                         .font(.title3)
                         .foregroundColor(.white.opacity(0.85))
                 }
-                .padding(.top, 20)
+                .padding(.top, 4)
 
                 // ── Avatar grid ───────────────────────────────────────────────
                 // LazyVGrid creates a responsive 3-column grid.
@@ -103,24 +113,46 @@ struct AvatarPickerView: View {
                 // ── Fight button ──────────────────────────────────────────────
                 // Only appears after the CPU reveal animation finishes.
                 if showFightButton, let player = selectedAvatar {
-                    Button {
-                        UIImpactFeedbackGenerator(style: .heavy).impactOccurred()
-                        onStartGame(player)
-                    } label: {
-                        Text("⚡️ LET'S FIGHT!")
-                            .font(.system(size: 22, weight: .black, design: .rounded))
-                            .foregroundColor(.white)
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 16)
-                            .background(
-                                LinearGradient(
-                                    colors: [.orange, .red],
-                                    startPoint: .leading,
-                                    endPoint: .trailing
+                    VStack(spacing: 12) {
+                        // Solo vs CPU
+                        Button {
+                            UIImpactFeedbackGenerator(style: .heavy).impactOccurred()
+                            if profile.playerName.isEmpty {
+                                pendingAvatar = player
+                                showNameEntry = true
+                            } else {
+                                onStartGame(player)
+                            }
+                        } label: {
+                            Label("⚡️ VS CPU", systemImage: "cpu")
+                                .font(.system(size: 20, weight: .black, design: .rounded))
+                                .foregroundColor(.white)
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 14)
+                                .background(
+                                    LinearGradient(colors: [.orange, .red],
+                                                   startPoint: .leading, endPoint: .trailing)
                                 )
-                            )
-                            .cornerRadius(18)
-                            .shadow(color: .orange.opacity(0.6), radius: 12, y: 4)
+                                .cornerRadius(18)
+                                .shadow(color: .orange.opacity(0.6), radius: 10, y: 4)
+                        }
+
+                        // 2-Player pass-and-play
+                        Button {
+                            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                            onMultiplayer(player)
+                        } label: {
+                            Label("👥 2 Players", systemImage: "person.2.fill")
+                                .font(.system(size: 20, weight: .black, design: .rounded))
+                                .foregroundColor(.white)
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 14)
+                                .background(
+                                    LinearGradient(colors: [.purple, .indigo],
+                                                   startPoint: .leading, endPoint: .trailing)
+                                )
+                                .cornerRadius(18)
+                        }
                     }
                     .padding(.horizontal, 40)
                     .transition(.scale.combined(with: .opacity))
@@ -131,6 +163,14 @@ struct AvatarPickerView: View {
         }
         .animation(.spring(response: 0.4, dampingFraction: 0.7), value: selectedAvatar?.id)
         .animation(.spring(response: 0.4, dampingFraction: 0.7), value: showFightButton)
+        // Feature 6: name entry sheet on first launch
+        .sheet(isPresented: $showNameEntry) {
+            NameEntrySheet(profile: profile) {
+                if let avatar = pendingAvatar {
+                    onStartGame(avatar)
+                }
+            }
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -319,6 +359,107 @@ struct VSBanner: View {
     }
 }
 
+
+
+// MARK: - ProfileHeader  (Feature 6)
+
+/// Compact strip shown at the top of the picker showing the player's
+/// name, best level, and total stars. Motivates them to keep playing.
+struct ProfileHeader: View {
+    @ObservedObject var profile: PlayerProfile
+
+    var body: some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 2) {
+                if profile.playerName.isEmpty {
+                    Text("Welcome, Player!")
+                        .font(.system(.subheadline, design: .rounded).bold())
+                        .foregroundColor(.white)
+                } else {
+                    Text("👋 \(profile.playerName)")
+                        .font(.system(.subheadline, design: .rounded).bold())
+                        .foregroundColor(.white)
+                }
+                if profile.bestLevel > 0 {
+                    Text("Best: Level \(profile.bestLevel)")
+                        .font(.caption)
+                        .foregroundColor(.white.opacity(0.7))
+                }
+            }
+
+            Spacer()
+
+            // Star tally
+            HStack(spacing: 4) {
+                Image(systemName: "star.fill")
+                    .foregroundColor(.yellow)
+                    .font(.subheadline)
+                Text("\(profile.totalStars)")
+                    .font(.system(.subheadline, design: .rounded).bold())
+                    .foregroundColor(.yellow)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .background(Color.white.opacity(0.15))
+            .cornerRadius(12)
+        }
+        .padding(.horizontal, 4)
+    }
+}
+
+
+// MARK: - NameEntrySheet  (Feature 6)
+
+/// Modal sheet shown on first launch. The player types their name and taps
+/// "Let's Go!" — the name is saved to PlayerProfile and the game starts.
+struct NameEntrySheet: View {
+    @ObservedObject var profile: PlayerProfile
+    let onDone: () -> Void
+
+    @State private var name: String = ""
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(spacing: 28) {
+            Text("What's your name?")
+                .font(.system(size: 28, weight: .black, design: .rounded))
+                .padding(.top, 40)
+
+            Text("We'll track your stars and best level 🌟")
+                .font(.subheadline)
+                .foregroundColor(.secondary)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 30)
+
+            TextField("Enter your name", text: $name)
+                .font(.system(.title3, design: .rounded))
+                .padding()
+                .background(Color(.systemGray6))
+                .cornerRadius(14)
+                .padding(.horizontal, 30)
+
+            Button {
+                let trimmed = name.trimmingCharacters(in: .whitespaces)
+                profile.setName(trimmed.isEmpty ? "Player" : trimmed)
+                dismiss()
+                onDone()
+            } label: {
+                Text("Let's Go! 🚀")
+                    .font(.system(.title3, design: .rounded).bold())
+                    .foregroundColor(.white)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 16)
+                    .background(LinearGradient(colors: [.orange, .red], startPoint: .leading, endPoint: .trailing))
+                    .cornerRadius(16)
+            }
+            .padding(.horizontal, 30)
+
+            Spacer()
+        }
+        .presentationDetents([.medium])
+    }
+}
+
 #Preview {
-    AvatarPickerView(onStartGame: { _ in })
+    AvatarPickerView(profile: PlayerProfile(), onStartGame: { _ in }, onMultiplayer: { _ in })
 }
